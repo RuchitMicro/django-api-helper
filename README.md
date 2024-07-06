@@ -14,7 +14,22 @@ Before using the Generic CRUD View, ensure you have Django and Django REST Frame
 
 ## Creating a CRUD View
 To create a CRUD view for your model, inherit from `GenericCRUDView` and specify the required attributes.
+This view is used to create a generic CRUD view for any model.
+It creates a view with the following endpoints:
+    - GET /api/model_name/ (List)
+    - GET /api/model_name/?pk=1 (Single)
+    - POST /api/model_name/ (Create)
+    - PATCH /api/model_name/?pk=1 (Update)
+    - DELETE /api/model_name/?pk=1 (Delete)
 
+The following attributes must be defined in the child class:
+    - permission_classes
+    - filter_backends
+    - filterset_class
+    - model
+    - pagination_class
+    - serializer_class
+    
 ### Example:
 ```python
 from myapp.views import GenericCRUDView
