@@ -1,12 +1,7 @@
-import json
-import pandas as pd
 import tablib  # Ensure tablib is installed
 
 # Django 
 from django.shortcuts       import get_object_or_404
-from django.db.models       import DateField, DateTimeField, Q, ForeignKey, BooleanField, IntegerField
-from django.core.exceptions import ValidationError
-from django.db              import transaction
 
 # DRF
 from rest_framework             import generics, status
@@ -14,10 +9,6 @@ from rest_framework.response    import Response
 from rest_framework.filters     import SearchFilter
 from rest_framework.exceptions  import PermissionDenied
 from rest_framework.parsers     import MultiPartParser, FormParser
-
-# Django Import Export
-from import_export import resources
-# from import_export.dataset import Dataset
 
 # Filters
 from django_filters.rest_framework  import DjangoFilterBackend
@@ -130,7 +121,7 @@ class GenericCRUDView(generics.GenericAPIView):
 
     # Get List or Single
     @check_table_permissions
-    @check_object_permissions(permission_prefix='view_')
+    # @check_object_permissions(permission_prefix='view_')
     @error_handling
     def get(self, request, *args, **kwargs):
         '''
@@ -184,7 +175,7 @@ class GenericCRUDView(generics.GenericAPIView):
 
     # Update
     @check_table_permissions
-    @check_object_permissions(permission_prefix='change_')
+    # @check_object_permissions(permission_prefix='change_')
     @error_handling
     def patch(self, request, *args, **kwargs):
         pk              =   request.GET.get('pk')
@@ -200,7 +191,7 @@ class GenericCRUDView(generics.GenericAPIView):
 
     # Delete
     @check_table_permissions
-    @check_object_permissions(permission_prefix='delete_')
+    # @check_object_permissions(permission_prefix='delete_')
     @error_handling
     def delete(self, request, *args, **kwargs):
         pk                  =   request.GET.get('pk')
@@ -338,65 +329,3 @@ class GenericBulkUploadView(generics.GenericAPIView):
 
 
 
-
-
-
-
-
-
-# Remove this later
-
-from rest_framework                     import status
-from rest_framework.response            import Response
-from rest_framework.views               import APIView
-from rest_framework_simplejwt.tokens    import RefreshToken
-from django.conf                        import settings
-from django.contrib.auth                import get_user_model
-import datetime
-
-class GenerateJWTToken(APIView):
-
-    def create_jwt(self, user, expiration_time):
-        """Create a JWT token from the given user."""
-        refresh = RefreshToken.for_user(user)
-
-        # Set the expiration time for the access token
-        refresh.access_token.set_exp(lifetime=expiration_time)
-
-        jwt_token = {
-            'refresh': str(refresh),
-            'access': str(refresh.access_token),
-        }
-        # Add the JWT token to the user object or return it as required
-        return jwt_token
-    
-    def get(self, request):
-        # Get the custom user model class from settings
-        custom_user_model = getattr(settings, 'AUTH_USER_MODEL', None)
-
-        if custom_user_model is None:
-            return Response({'detail': 'AUTH_USER_MODEL is not set in settings'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-        try:
-            # Create a new user instance based on the custom user model
-            user = get_user_model()
-
-            # Make sure the custom user model has a valid username or email field
-            if not hasattr(user, 'username') and not hasattr(user, 'email'):
-                return Response({'detail': 'Custom user model must have a username or email field'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-            expiry_days = request.GET.get('expiry_days')
-
-            if expiry_days is None:
-                return Response({'detail': 'expiry_days is required'}, status=status.HTTP_400_BAD_REQUEST)
-            
-            # Calculate the expiration time as timedelta
-            expiration_time = datetime.timedelta(days=int(expiry_days))
-
-            token = self.create_jwt(user.objects.get(email='admin@admin.com'), expiration_time)
-            
-
-            return Response(token, status=status.HTTP_200_OK)
-
-        except Exception as e:
-            return Response({'detail': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

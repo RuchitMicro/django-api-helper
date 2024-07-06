@@ -40,13 +40,13 @@ def read(f):
 
 setup(
     name                            =   "django-api-helper",
-    version                         =   "0.0.1",
+    version                         =   "0.0.2",
     author                          =   "Ruchit Kharwa",
     author_email                    =   "ruchit@wolfx.io",
     description                     =   "An abstraction layer for creating APIs in Django Rest Framework, supports rpc style APIs.",
     long_description                =   read('README.md'),
     long_description_content_type   =   "text/markdown",
-    url                             =   "https://github.com/ruchitmicro/django-api-helper",
+    url                             =   "https://github.com/RuchitMicro/django-api-helper",
     packages                        =   find_packages(),
     classifiers=[
         "Programming Language :: Python :: 3",
@@ -59,7 +59,6 @@ setup(
         "django>=3.0",
         "django-api-helper",
         "django-filter",
-        "django-import-export",
     ],
 )
 
