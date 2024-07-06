@@ -5,13 +5,12 @@
 The Generic CRUD View in Django is a powerful tool for creating RESTful APIs with Create, Read, Update, and Delete functionalities. This user manual covers how to set up and use the Generic CRUD View, including configuring URLs, permissions, pagination, and views.
 
 ## Setting Up
-Before using the Generic CRUD View, ensure you have Django and Django REST Framework installed in your environment. Additionally, install `django-filter` and `django-guardian` for advanced filtering and object-level permissions.
+Before using the Generic CRUD View, ensure you have Django and Django REST Framework installed in your environment. Additionally, install `django-filter` for advanced filtering.
 
 ### Dependencies:
 - Django
 - Django REST Framework
 - django-filter
-- django-guardian
 
 ## Creating a CRUD View
 To create a CRUD view for your model, inherit from `GenericCRUDView` and specify the required attributes.
