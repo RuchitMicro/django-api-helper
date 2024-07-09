@@ -16,7 +16,8 @@ def check_table_permissions(view_func):
     def _wrapped_view(view, request, *args, **kwargs):
         app_label   = view.app_label
         model_name  = view.model_name
-        # permission  = f'{app_label}.view_{model_name}'
+        permission  = f'{app_label}.view_{model_name}'
+        view.queryset   =   view.get_queryset()
         
         # if not request.user.has_perm(permission):
         #     return Response({'error': 'You do not have permission to access this table.', 'detail': 'Does not have table level permissions.'}, status=status.HTTP_403_FORBIDDEN)

@@ -40,7 +40,7 @@ def read(f):
 
 setup(
     name                            =   "django-api-helper",
-    version                         =   "0.0.2",
+    version                         =   "0.0.6",
     author                          =   "Ruchit Kharwa",
     author_email                    =   "ruchit@wolfx.io",
     description                     =   "An abstraction layer for creating APIs in Django Rest Framework, supports rpc style APIs.",

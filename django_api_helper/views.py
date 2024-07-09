@@ -1,7 +1,9 @@
 import tablib  # Ensure tablib is installed
 
 # Django 
+from django.conf            import settings
 from django.shortcuts       import get_object_or_404
+from django.core.exceptions import FieldDoesNotExist
 
 # DRF
 from rest_framework             import generics, status
@@ -87,6 +89,20 @@ class GenericCRUDView(generics.GenericAPIView):
     # Get Query
     def get_queryset(self):
         queryset = self.model.objects.all()
+
+        order_by = self.request.query_params.get('order_by', None)
+
+        if order_by:
+            ordering_fields = order_by.split(',')
+            # Validate the fields are part of the model
+            for field in ordering_fields:
+                field_name = field.lstrip('-')
+                try:
+                    self.model._meta.get_field(field_name)
+                except FieldDoesNotExist:
+                    raise ValueError(f"Invalid field name for ordering: {field_name}")
+
+            queryset = queryset.order_by(*ordering_fields)
 
         # Apply additional filters if any
         filtered_queryset = self.filterset_class(self.request.GET, queryset=queryset)
