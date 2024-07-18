@@ -1,5 +1,5 @@
 
-# Generic CRUD View User Manual
+# Generic CRUD View API
 
 ## Overview
 The Generic CRUD View in Django is a powerful tool for creating RESTful APIs with Create, Read, Update, and Delete functionalities. This user manual covers how to set up and use the Generic CRUD View, including configuring URLs, permissions, pagination, and views.
