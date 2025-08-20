@@ -1,9 +1,13 @@
 import tablib  # Ensure tablib is installed
+import os
+
 
 # Django 
 from django.conf            import settings
 from django.shortcuts       import get_object_or_404
 from django.core.exceptions import FieldDoesNotExist
+from django.http                    import HttpResponse, FileResponse, JsonResponse, HttpResponseRedirect, Http404, HttpResponseForbidden, HttpResponseBadRequest, HttpResponseServerError
+from django.urls            import get_resolver, URLPattern, URLResolver
 
 # DRF
 from rest_framework             import generics, status
@@ -11,6 +15,7 @@ from rest_framework.response    import Response
 from rest_framework.filters     import SearchFilter
 from rest_framework.exceptions  import PermissionDenied
 from rest_framework.parsers     import MultiPartParser, FormParser
+from rest_framework.views       import APIView
 
 # Filters
 from django_filters.rest_framework  import DjangoFilterBackend
@@ -134,7 +139,17 @@ class GenericCRUDView(generics.GenericAPIView):
             requested_depth = SERIALIZER_MIN_DEPTH
         return min(SERIALIZER_MAX_DEPTH, max(SERIALIZER_MIN_DEPTH, requested_depth))
 
-
+    def get_single(self, pk):
+        """
+        Helper method to get a single object by primary key.
+        """
+        try:
+            saved_object = get_object_or_404(self.queryset, pk=pk)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_404_NOT_FOUND)
+        serializer = self.get_serializer_class()(saved_object)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+        
     # Get List or Single
     @check_table_permissions
     # @check_object_permissions(permission_prefix='view_')
@@ -149,12 +164,11 @@ class GenericCRUDView(generics.GenericAPIView):
 
         So value of self.queryset is actually getting assigned from the decorator.
         '''
+
         # GET Single
         pk = request.GET.get('pk')
         if pk:
-            saved_object    =   get_object_or_404(self.queryset, pk=pk)
-            serializer      =   self.get_serializer_class()(saved_object)
-            return Response(serializer.data, status=status.HTTP_200_OK)
+            return self.get_single(pk)
 
         # GET LIST
         page                =   self.paginate_queryset(self.queryset)
@@ -344,4 +358,92 @@ class GenericBulkUploadView(generics.GenericAPIView):
         return {"technical": error_messages, "user_friendly": pretty_error_messages}
 
 
+##### Generic API Views #####
+class ReadOnlyView(GenericCRUDView):
+    def post(self, request, *args, **kwargs):
+        return HttpResponseForbidden()
+    
+    def patch(self, request, *args, **kwargs):
+        return HttpResponseForbidden()
+    
+    def delete(self, request, *args, **kwargs):
+        return HttpResponseForbidden()
+    
+    download_field = None        # e.g. "video"
+    
+    def dispatch(self, request, *args, **kwargs):
+        """
+        If the caller added ?download=true (or 1 / yes) to a GET request,
+        stream the file attached to <download_field>; otherwise fall back
+        to the normal DRF dispatch flow (list/detail/create/…).
+        """
+        if (
+            request.method.lower() == "get"
+            and str(request.GET.get("download", "")).lower() in ("1", "true", "yes")
+        ):
+            pk = request.GET.get("pk") or kwargs.get("pk")
+            if not pk:
+                return Response(
+                    {"detail": "pk query-param is required."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
 
+            try:
+                obj = self.model.objects.get(pk=pk)
+            except self.model.DoesNotExist:
+                raise Http404("Object not found")
+
+            # Find the correct FileField --------------------------------
+            field_name = self.download_field
+            if field_name is None:                       # fallback: first FileField on the model
+                for f in self.model._meta.fields:
+                    if f.get_internal_type() == "FileField":
+                        field_name = f.name
+                        break
+
+            file_field = getattr(obj, field_name, None)
+            if not file_field:
+                return Response(
+                    {"detail": "No file attached to this object."},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+
+            return FileResponse(
+                file_field.open("rb"),
+                as_attachment=True,
+                filename=os.path.basename(file_field.name)
+            )
+
+        # No ?download=true → normal GenericAPIView life-cycle
+        return super().dispatch(request, *args, **kwargs)
+
+
+# API Index
+class APIIndexView(APIView):
+    permission_classes  =   []
+    app_name            =   ''  
+
+    def get(self, request):
+        if not self.app_name:
+            return Response({"error": "app_name is not set for APIIndexView"}, status=status.HTTP_400_BAD_REQUEST)
+        
+        resolver = get_resolver()
+        api_endpoints = {}
+
+        def extract_urls(urlpatterns, parent_pattern=''):
+            for pattern in urlpatterns:
+                if isinstance(pattern, URLPattern):
+                    if pattern.lookup_str.startswith(f'{self.app_name}.'):
+                        name = pattern.name or pattern.lookup_str
+                        full_path = parent_pattern + str(pattern.pattern)
+                        url = request.build_absolute_uri("/" + full_path.lstrip("/"))
+                        url = url.replace('<', '&lt;').replace('>', '&gt;')  # HTML safe if needed
+                        api_endpoints[name] = url
+                elif isinstance(pattern, URLResolver):
+                    nested_pattern = parent_pattern + str(pattern.pattern)
+                    extract_urls(pattern.url_patterns, nested_pattern)
+
+        extract_urls(resolver.url_patterns)
+
+        return Response(api_endpoints)
+    
