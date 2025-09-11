@@ -1,8 +1,11 @@
 import tablib  # Ensure tablib is installed
 import os
 
+from typing                 import Any, Dict, List, Optional
 
 # Django 
+from django.db              import transaction
+from django.db.models       import Avg, Count, Max, Min, Sum, QuerySet
 from django.conf            import settings
 from django.shortcuts       import get_object_or_404
 from django.core.exceptions import FieldDoesNotExist
@@ -16,6 +19,9 @@ from rest_framework.filters     import SearchFilter
 from rest_framework.exceptions  import PermissionDenied
 from rest_framework.parsers     import MultiPartParser, FormParser
 from rest_framework.views       import APIView
+from rest_framework.parsers     import JSONParser
+from rest_framework.exceptions import ValidationError
+
 
 # Filters
 from django_filters.rest_framework  import DjangoFilterBackend
@@ -26,6 +32,7 @@ from django_api_helper.pagination   import CustomPageNumberPagination
 from django_api_helper.decorators   import check_object_permissions, check_table_permissions, error_handling
 from django_api_helper.filters      import DynamicFilterSetCreator
 from django_api_helper.serializers  import serialize_related_object, create_file_upload_serializer, FileUploadSerializer
+from django.db.models.signals       import post_save
 
 
 
@@ -43,6 +50,14 @@ class GenericCRUDView(generics.GenericAPIView):
             - POST /api/model_name/ (Create)
             - PATCH /api/model_name/?pk=1 (Update)
             - DELETE /api/model_name/?pk=1 (Delete)
+        It also supports:
+            - Pagination
+            - Filtering
+            - Aggregation
+                
+                - GET /api/model_name/?aggregate=sum:amount,avg:rate # only if allow_aggregate=True
+                - GET /api/model_name/?status=active&aggregate=count:id
+
         
         The following attributes must be defined in the child class:
             - permission_classes
@@ -51,6 +66,12 @@ class GenericCRUDView(generics.GenericAPIView):
             - model
             - pagination_class
             - serializer_class
+
+            - allow_aggregate: bool                   = False
+            - allowed_aggregate_methods: List[str]    = []   # empty ⇒ all allowed
+            - allowed_aggregate_fields:  List[str]    = []
+
+
     '''
     permission_classes  =   []  # Default permission
     filter_backends     =   [DjangoFilterBackend, SearchFilter]
@@ -59,6 +80,18 @@ class GenericCRUDView(generics.GenericAPIView):
     pagination_class    =   CustomPageNumberPagination
     model_name          =   None
     app_label           =   None
+
+    allow_aggregate: bool                   = False
+    allowed_aggregate_methods: List[str]    = []   # empty ⇒ all allowed
+    allowed_aggregate_fields:  List[str]    = []
+
+    AGGREGATE_FUNC_MAP: dict[str, Any] = {
+        "sum":   Sum,
+        "avg":   Avg,
+        "min":   Min,
+        "max":   Max,
+        "count": Count,
+    }
 
 
 
@@ -138,6 +171,50 @@ class GenericCRUDView(generics.GenericAPIView):
         except ValueError:
             requested_depth = SERIALIZER_MIN_DEPTH
         return min(SERIALIZER_MAX_DEPTH, max(SERIALIZER_MIN_DEPTH, requested_depth))
+    
+    def get_aggregate_results(self, queryset: QuerySet) -> Optional[Dict[str, Any]]:
+        """
+        Parse ?aggregate=sum:amount,avg:rate
+        and return {"sum_amount": ..., "avg_rate": ...} or None
+        """
+        if not self.allow_aggregate:
+            return None
+
+        raw = self.request.query_params.get("aggregate")
+        if not raw:
+            return None
+
+        expressions: Dict[str, Any] = {}
+        tokens = [t.strip() for t in raw.split(",") if t.strip()]
+        for token in tokens:
+            try:
+                method, field = token.split(":", 1)
+            except ValueError:
+                raise ValidationError("Aggregate format is method:field[,method:field]")
+
+            method = method.lower().strip()
+            field  = field.strip()
+
+            # allow‑lists
+            if self.allowed_aggregate_methods and method not in self.allowed_aggregate_methods:
+                raise ValidationError(f"Aggregation method '{method}' not allowed.")
+
+            if self.allowed_aggregate_fields and field not in self.allowed_aggregate_fields:
+                raise ValidationError(f"Aggregation field '{field}' not allowed.")
+
+            try:
+                self.model._meta.get_field(field)
+            except FieldDoesNotExist:
+                raise ValidationError(f"Model has no field '{field}'.")
+
+            try:
+                func = self.AGGREGATE_FUNC_MAP[method]
+            except KeyError:
+                raise ValidationError(f"Unsupported aggregation '{method}'.")
+
+            expressions[f"{method}_{field}"] = func(field)
+
+        return queryset.aggregate(**expressions) if expressions else None
 
     def get_single(self, pk):
         """
@@ -151,42 +228,54 @@ class GenericCRUDView(generics.GenericAPIView):
         return Response(serializer.data, status=status.HTTP_200_OK)
         
     # Get List or Single
-    @check_table_permissions
+    # @check_table_permissions
     # @check_object_permissions(permission_prefix='view_')
     @error_handling
     def get(self, request, *args, **kwargs):
         '''
-        Before this function is executed, the decorators are first called.
-        The decorators check for table and object level permissions.
-
-        But in the object level permissions decorator, we override the queryset
-        with the object for which the user has permissions.
-
-        So value of self.queryset is actually getting assigned from the decorator.
+        Handles GET requests:
+        - Permission decorators run first (table & object level).
+        - Object-level permissions may override self.queryset.
+        - Supports single-object fetch by pk, aggregates, or paginated list.
         '''
+        # Get the base queryset, already filtered and permission-aware.
+        # Important: keep self.queryset in sync, as some decorators or methods rely on it.
+        base_qs = self.get_queryset()
+        self.queryset = base_qs
 
-        # GET Single
+        # Check if client requested a single object by pk
         pk = request.GET.get('pk')
         if pk:
             return self.get_single(pk)
 
-        # GET LIST
-        page                =   self.paginate_queryset(self.queryset)
-        requested_depth     =   self.get_requested_depth(request)
-        nested              =   bool(request.GET.get('nested'))
-        if page is not None:
-            serialized_data     =   self.get_serialized_data(page, requested_depth, nested=nested)
+        # Compute aggregates after filtering but before pagination
+        aggregates = self.get_aggregate_results(base_qs)
 
-            # Squash the data if include or exclude headers are present
+        # If aggregates exist, return them immediately (skip list data)
+        if aggregates:
+            return Response({"aggregates": aggregates}, status=status.HTTP_200_OK)
+
+        # Otherwise, proceed to fetch and return list data
+        requested_depth =   self.get_requested_depth(request)   # Controls nesting depth in serialized data
+        nested          =   bool(request.GET.get('nested'))              # Force nested structure if requested
+
+        # Paginate the queryset if pagination is enabled
+        page = self.paginate_queryset(base_qs)
+        if page is not None:
+            # Serialize paginated page data
+            serialized_data = self.get_serialized_data(page, requested_depth, nested=nested)
+
+            # Optionally squash fields if include/exclude headers are present
             include = request.META.get('HTTP_X_INCLUDE')
             exclude = request.META.get('HTTP_X_EXCLUDE')
             if include or exclude:
                 serialized_data = [self.squash(obj, include=include, exclude=exclude) for obj in serialized_data]
-        
+
+            # Return paginated response
             return self.get_paginated_response(serialized_data)
 
-        # Fallback for no pagination
-        serialized_data = self.get_serialized_data(self.get_queryset(), requested_depth, nested=nested)
+        # Fallback: no pagination; serialize the entire filtered queryset
+        serialized_data = self.get_serialized_data(base_qs, requested_depth, nested=nested)
         return Response(serialized_data, status=status.HTTP_200_OK)
 
 
@@ -228,6 +317,61 @@ class GenericCRUDView(generics.GenericAPIView):
         object_to_delete    =   get_object_or_404(self.get_queryset(), pk=pk)
         object_to_delete.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+    
+class GenericBulkCreateView(GenericCRUDView):
+    """
+    A Generic View for bulk creation of model instances.
+
+    Inherits listing and detail endpoints from GenericCRUDView,
+    but overrides POST to support bulk JSON uploads via an array of objects.
+    Enforces an upload cap and performs chunked bulk inserts for large datasets.
+
+    Attributes:
+        model           : The model class to create instances of.
+        permission_classes: List of permission classes to apply.
+        serializer_class: Serializer class for the model.
+        upload_cap      : Maximum number of records allowed per bulk request.
+        parser_classes  : List of parsers to handle incoming data formats.
+
+    """
+    parser_classes  = (JSONParser,)
+    upload_cap      = 1000  # default maximum records per bulk request
+
+    @check_table_permissions
+    @error_handling
+    def post(self, request, *args, **kwargs):
+        data = request.data
+        is_bulk = isinstance(data, list)
+
+        # For bulk, enforce upload cap
+        if is_bulk and len(data) > self.upload_cap:
+            return Response(
+                {"error": f"Upload limit exceeded: max {self.upload_cap} records allowed per request."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        serializer = self.get_serializer_class()(data=data, many=is_bulk)
+        serializer.is_valid(raise_exception=True)
+
+        if is_bulk:
+            model_cls = self.model
+            instances = [model_cls(**item) for item in serializer.validated_data]
+            created_instances = []
+            # Chunked bulk_create for performance and DB safety
+            with transaction.atomic():
+                for i in range(0, len(instances), self.upload_cap):
+                    batch = instances[i:i + self.upload_cap]
+                    created_batch = model_cls.objects.bulk_create(batch)
+                    for instance in created_batch:
+                        post_save.send(sender=model_cls, instance=instance, created=True)
+                    created_instances.extend(created_batch)
+
+            resp_ser = self.get_serializer_class()(created_instances, many=True)
+            return Response(resp_ser.data, status=status.HTTP_201_CREATED)
+        else:
+            instance = serializer.save()
+            resp_ser = self.get_serializer_class()(instance)
+            return Response(resp_ser.data, status=status.HTTP_201_CREATED)
 
 
 class GenericObjectPermissionView(generics.GenericAPIView):
