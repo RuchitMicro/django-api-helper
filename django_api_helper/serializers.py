@@ -1,138 +1,147 @@
+"""Dynamic serializers and output redaction helpers."""
 
-from django.db              import models
-from django.db.models       import ForeignKey
-from django.core.exceptions import FieldDoesNotExist
-from rest_framework         import serializers
+import json
 
-SENSITIVE_FIELD_NAMES = {"password", "user", "token", "secret", "api_key"}
+from django.db import models
+from rest_framework import serializers
 
-def is_sensitive_field(field):
-    if field.name.lower() in SENSITIVE_FIELD_NAMES:
+DEFAULT_SENSITIVE_FIELD_NAMES = frozenset({
+    "password", "password_hash", "passwd", "pass_hash", "token", "access_token",
+    "refresh_token", "secret", "api_key", "authorization", "private_key",
+})
+
+
+def normalize_field_list(value):
+    """Accept the legacy list input plus comma and semicolon separated headers."""
+    if value in (None, ""):
+        return []
+    if isinstance(value, str):
+        value = value.strip()
+        if value.startswith("[") and value.endswith("]"):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                pass
+        if isinstance(value, str):
+            value = [item.strip() for item in value.replace(";", ",").split(",")]
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [str(value).strip()]
+
+
+def is_sensitive_name(name, sensitive_field_names=None):
+    name = str(name).lower()
+    names = {str(item).lower() for item in (sensitive_field_names or DEFAULT_SENSITIVE_FIELD_NAMES)}
+    return name in names or name.endswith("password")
+
+
+def is_sensitive_field(field, include_sensitive_fields=False, sensitive_field_names=None):
+    if include_sensitive_fields:
+        return False
+    if is_sensitive_name(field.name, sensitive_field_names):
         return True
-    if isinstance(field, (models.FileField, models.ImageField)):
-        storage = getattr(field, "storage", None)
-        if storage and getattr(storage, "default_acl", None) == "private":
-            return True
-    return False
+    storage = getattr(field, "storage", None)
+    return isinstance(field, (models.FileField, models.ImageField)) and getattr(storage, "default_acl", None) == "private"
 
-def create_model_serializer(model_name, include=None, exclude=None, read_only=None):
-    if not include:
-        api_meta        = getattr(model_name, 'api_meta', {})
-        field_list      = [f.name for f in model_name._meta.fields if not is_sensitive_field(f)]
-        api_functions   = api_meta.get('api_function', [])
-        all_fields      = field_list + api_functions
+
+def redact_sensitive_data(value, include_sensitive_fields=False, sensitive_field_names=None):
+    """Recursively remove credentials even when a consumer uses a custom serializer."""
+    if include_sensitive_fields:
+        return value
+    if isinstance(value, dict):
+        return {
+            key: redact_sensitive_data(child, False, sensitive_field_names)
+            for key, child in value.items()
+            if not is_sensitive_name(key, sensitive_field_names)
+        }
+    if isinstance(value, list):
+        return [redact_sensitive_data(child, False, sensitive_field_names) for child in value]
+    return value
+
+
+def create_model_serializer(model_name, include=None, exclude=None, read_only=None,
+                            include_sensitive_fields=False, sensitive_field_names=None):
+    include_fields = normalize_field_list(include)
+    excluded_fields = set(normalize_field_list(exclude))
+    api_functions = list(getattr(model_name, "api_meta", {}).get("api_function", []))
+    if include_fields:
+        fields = include_fields
     else:
-        all_fields = include
+        fields = [
+            field.name for field in (*model_name._meta.fields, *model_name._meta.many_to_many)
+            if not is_sensitive_field(field, include_sensitive_fields, sensitive_field_names)
+        ] + api_functions
+    fields = [
+        field for field in fields
+        if field not in excluded_fields and (
+            include_sensitive_fields or not is_sensitive_name(field, sensitive_field_names)
+        )
+    ]
 
-    if exclude:
-        all_fields = [field for field in all_fields if field not in exclude]
+    serializer_fields = fields
 
     class DynamicSerializer(serializers.ModelSerializer):
-        for method_name in getattr(model_name, 'api_meta', {}).get('api_function', []):
-            locals()[method_name] = serializers.SerializerMethodField()
-        
         class Meta:
-            model               = model_name
-            fields              = all_fields
-            read_only_fields    = read_only if read_only else []
+            model = model_name
+            fields = serializer_fields
+            read_only_fields = read_only or []
 
         def to_representation(self, instance):
-            ret = super().to_representation(instance)
-            for method_name in getattr(model_name, 'api_meta', {}).get('api_function', []):
-                method = getattr(self, f'get_{method_name}')
-                ret[method_name] = method(instance)
-            return ret
+            return redact_sensitive_data(
+                super().to_representation(instance), include_sensitive_fields, sensitive_field_names
+            )
 
-        def validate_created_by(self, value):
-            request = self.context.get('request')
-            if request and hasattr(request, 'user'):
-                if request.user != value:
-                    raise serializers.ValidationError("Invalid data for created_by.")
-            return value
-
-    for method_name in getattr(model_name, 'api_meta', {}).get('api_function', []):
-        def method_handler(self, instance, method_name=method_name):
-            method = getattr(instance, method_name)
-            return method()
-        setattr(DynamicSerializer, f'get_{method_name}', method_handler)
+    for method_name in api_functions:
+        def method_handler(self, instance, name=method_name):
+            return getattr(instance, name)()
+        setattr(DynamicSerializer, method_name, serializers.SerializerMethodField())
+        setattr(DynamicSerializer, f"get_{method_name}", method_handler)
 
     return DynamicSerializer
 
-def serialize_related_object(obj, depth=5, include=None, exclude=None, read_only=None):
+
+def serialize_related_object(obj, depth=5, include=None, exclude=None, read_only=None,
+                             include_sensitive_fields=False, sensitive_field_names=None, visited=None):
+    """Serialize forward relations safely, stopping cycles and excluded fields."""
     if obj is None:
         return None
     if depth <= 0:
-        return {'pk': obj.pk}
+        return {"pk": obj.pk}
+    visited = set() if visited is None else visited
+    identity = (obj._meta.label_lower, obj.pk)
+    if identity in visited:
+        return {"pk": obj.pk}
+    visited = visited | {identity}
 
-    api_functions   = getattr(type(obj), 'api_meta', {}).get('api_function', [])
-    model_fields    = [f for f in type(obj)._meta.fields if not is_sensitive_field(f)]
-    all_fields      = [f.name for f in model_fields] + api_functions
-    _include        = include if include else all_fields
-    _exclude        = exclude if exclude else []
+    serializer_class = create_model_serializer(
+        type(obj), include, exclude, read_only, include_sensitive_fields, sensitive_field_names
+    )
+    representation = serializer_class(obj).data
+    for field in obj._meta.fields:
+        if field.name not in representation or is_sensitive_field(field, include_sensitive_fields, sensitive_field_names):
+            continue
+        if isinstance(field, (models.ForeignKey, models.OneToOneField)):
+            related = getattr(obj, field.name)
+            representation[field.name] = serialize_related_object(
+                related, depth - 1, include_sensitive_fields=include_sensitive_fields,
+                sensitive_field_names=sensitive_field_names, visited=visited,
+            )
+    for field in obj._meta.many_to_many:
+        if field.name in representation:
+            representation[field.name] = [
+                serialize_related_object(related, depth - 1, include_sensitive_fields=include_sensitive_fields,
+                                         sensitive_field_names=sensitive_field_names, visited=visited)
+                for related in getattr(obj, field.name).all()
+            ]
+    return redact_sensitive_data(representation, include_sensitive_fields, sensitive_field_names)
 
-    class DynamicSerializer(serializers.ModelSerializer):
-        class Meta:
-            model               = type(obj)
-            fields              = _include
-            exclude             = _exclude
-            read_only_fields    = read_only if read_only else []
 
-        def to_representation(self, instance):
-            ret = super().to_representation(instance)
-            self._serialize_related_fields(instance, ret, depth)
-            return ret
+def create_file_upload_serializer(model_name, include=None, exclude=None, read_only=None,
+                                  include_sensitive_fields=False, sensitive_field_names=None):
+    return create_model_serializer(
+        model_name, include, exclude, read_only, include_sensitive_fields, sensitive_field_names
+    )
 
-        def _serialize_related_fields(self, instance, ret, depth):
-            for field_name in [f.name for f in model_fields]:
-                try:
-                    field = instance._meta.get_field(field_name)
-                    self._serialize_field(instance, field, field_name, ret, depth)
-                except FieldDoesNotExist:
-                    pass
-
-        def _serialize_field(self, instance, field, field_name, ret, depth):
-            if isinstance(field, (models.ForeignKey, models.OneToOneField)) and ret[field_name] is not None:
-                related_obj = getattr(instance, field_name)
-                ret[field_name] = serialize_related_object(related_obj, depth-1)
-            elif isinstance(field, models.ManyToManyField):
-                related_objs = getattr(instance, field_name).all()
-                ret[field_name] = [serialize_related_object(related_obj, depth-1) for related_obj in related_objs]
-
-    return DynamicSerializer(obj).data
-
-def create_file_upload_serializer(model_name, include=None, exclude=None, read_only=None):
-    if not include:
-        field_list = [f.name for f in model_name._meta.fields if not is_sensitive_field(f)] + \
-                     [f.name for f in model_name._meta.related_objects]
-    else:
-        field_list = include
-
-    if exclude:
-        field_list = [field for field in field_list if field not in exclude]
-
-    class DynamicFileUploadSerializer(serializers.ModelSerializer):
-        class Meta:
-            model = model_name
-            fields = field_list
-            read_only_fields = read_only if read_only else []
-
-        def validate(self, data):
-            for field_name, value in list(data.items()):
-                parts = field_name.split('__', 1)
-                if len(parts) == 2 and hasattr(model_name, parts[0]):
-                    related_field_name, related_lookup = parts
-                    model_field = model_name._meta.get_field(related_field_name)
-                    if isinstance(model_field, ForeignKey):
-                        lookup_model = model_field.related_model
-                        try:
-                            lookup_instance = lookup_model.objects.get(**{related_lookup: value})
-                            data[related_field_name] = lookup_instance.pk
-                        except lookup_model.DoesNotExist:
-                            raise serializers.ValidationError(f"{lookup_model.__name__} with {related_lookup}={value} does not exist.")
-                        del data[field_name]
-            return data
-
-    return DynamicFileUploadSerializer
 
 class FileUploadSerializer(serializers.Serializer):
     file = serializers.FileField()
