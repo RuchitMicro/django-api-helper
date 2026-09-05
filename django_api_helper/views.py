@@ -3,24 +3,24 @@
 import os
 import warnings
 
-from django.conf import settings
-from django.core.exceptions import FieldDoesNotExist
-from django.db import transaction
-from django.db.models import Avg, Count, Max, Min, Sum
-from django.http import FileResponse
-from django.shortcuts import get_object_or_404
-from django.urls import URLPattern, URLResolver, get_resolver
+from django.conf                     import settings
+from django.core.exceptions          import FieldDoesNotExist
+from django.db                       import transaction
+from django.db.models                import Avg, Count, Max, Min, Sum
+from django.http                     import FileResponse
+from django.shortcuts                import get_object_or_404
+from django.urls                     import URLPattern, URLResolver, get_resolver
 from django_filters.rest_framework import DjangoFilterBackend
-from rest_framework import generics, status
-from rest_framework.exceptions import PermissionDenied, ValidationError
-from rest_framework.filters import SearchFilter
-from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
-from rest_framework.response import Response
-from rest_framework.views import APIView
+from rest_framework                  import generics, status
+from rest_framework.exceptions       import PermissionDenied, ValidationError
+from rest_framework.filters          import SearchFilter
+from rest_framework.parsers          import FormParser, JSONParser, MultiPartParser
+from rest_framework.response         import Response
+from rest_framework.views            import APIView
 
-from django_api_helper.decorators import check_table_permissions, error_handling, error_response
-from django_api_helper.filters import DynamicFilterSetCreator
-from django_api_helper.pagination import CustomPageNumberPagination
+from django_api_helper.decorators    import check_table_permissions, error_handling, error_response
+from django_api_helper.filters       import DynamicFilterSetCreator
+from django_api_helper.pagination    import CustomPageNumberPagination
 from django_api_helper.serializers import (
     DEFAULT_SENSITIVE_FIELD_NAMES,
     FileUploadSerializer,
@@ -33,37 +33,37 @@ from django_api_helper.serializers import (
 class GenericCRUDView(generics.GenericAPIView):
     """CRUD endpoint using ``?pk=`` for details and optional nested output."""
 
-    permission_classes = []
-    filter_backends = [DjangoFilterBackend, SearchFilter]
-    filterset_class = None
-    model = None
-    pagination_class = CustomPageNumberPagination
-    model_name = None
-    app_label = None
+    permission_classes           = []
+    filter_backends              = [DjangoFilterBackend, SearchFilter]
+    filterset_class              = None
+    model                        = None
+    pagination_class             = CustomPageNumberPagination
+    model_name                   = None
+    app_label                    = None
 
-    allow_aggregate = False
-    allowed_aggregate_methods = []
-    allowed_aggregate_fields = []
-    select_related_fields = ()
-    prefetch_related_fields = ()
-    include_sensitive_fields = False
-    sensitive_field_names = DEFAULT_SENSITIVE_FIELD_NAMES
+    allow_aggregate              = False
+    allowed_aggregate_methods    = []
+    allowed_aggregate_fields     = []
+    select_related_fields        = ()
+    prefetch_related_fields      = ()
+    include_sensitive_fields     = False
+    sensitive_field_names        = DEFAULT_SENSITIVE_FIELD_NAMES
 
     AGGREGATE_FUNC_MAP = {"sum": Sum, "avg": Avg, "min": Min, "max": Max, "count": Count}
 
     def __init__(self, **kwargs):
         if self.model is None:
             raise TypeError("GenericCRUDView subclasses must define model.")
-        self.app_label = self.model._meta.app_label
-        self.model_name = self.model._meta.model_name
+        self.app_label           = self.model._meta.app_label
+        self.model_name          = self.model._meta.model_name
         if self.filterset_class is None:
             self.filterset_class = DynamicFilterSetCreator(self.model).get_filterset()
         super().__init__(**kwargs)
 
     def squash(self, obj, include=None, exclude=None):
         """Project only root response fields. Exclude has precedence over include."""
-        include_fields = set(normalize_field_list(include))
-        exclude_fields = set(normalize_field_list(exclude))
+        include_fields           = set(normalize_field_list(include))
+        exclude_fields           = set(normalize_field_list(exclude))
         if not isinstance(obj, dict):
             return obj
         return {
@@ -72,8 +72,8 @@ class GenericCRUDView(generics.GenericAPIView):
         }
 
     def project_response(self, data, request):
-        include = request.META.get("HTTP_X_INCLUDE")
-        exclude = request.META.get("HTTP_X_EXCLUDE")
+        include                  = request.META.get("HTTP_X_INCLUDE")
+        exclude                  = request.META.get("HTTP_X_EXCLUDE")
         if not include and not exclude:
             return data
         if isinstance(data, list):
@@ -81,15 +81,15 @@ class GenericCRUDView(generics.GenericAPIView):
         return self.squash(data, include, exclude)
 
     def get_queryset(self):
-        queryset = self.model.objects.all()
+        queryset                 = self.model.objects.all()
         if self.select_related_fields:
             queryset = queryset.select_related(*self.select_related_fields)
         if self.prefetch_related_fields:
             queryset = queryset.prefetch_related(*self.prefetch_related_fields)
 
-        order_by = self.request.query_params.get("order_by")
+        order_by                 = self.request.query_params.get("order_by")
         if order_by:
-            ordering_fields = [field.strip() for field in order_by.split(",") if field.strip()]
+            ordering_fields      = [field.strip() for field in order_by.split(",") if field.strip()]
             if not ordering_fields:
                 raise ValidationError({"order_by": ["Provide at least one field."]})
             for field in ordering_fields:
@@ -99,7 +99,7 @@ class GenericCRUDView(generics.GenericAPIView):
                     raise ValidationError({"order_by": [f"Unknown ordering field: {field.lstrip('-')}."]})
             queryset = queryset.order_by(*ordering_fields)
 
-        filterset = self.filterset_class(self.request.query_params, queryset=queryset)
+        filterset                = self.filterset_class(self.request.query_params, queryset=queryset)
         if not filterset.is_valid():
             raise ValidationError(filterset.errors)
         return filterset.qs
@@ -125,10 +125,10 @@ class GenericCRUDView(generics.GenericAPIView):
         return redact_sensitive_data(data, self.include_sensitive_fields, self.sensitive_field_names)
 
     def get_requested_depth(self, request):
-        minimum = getattr(settings, "SERIALIZER_MIN_DEPTH", 1)
-        maximum = getattr(settings, "SERIALIZER_MAX_DEPTH", 3)
+        minimum                  = getattr(settings, "SERIALIZER_MIN_DEPTH", 1)
+        maximum                  = getattr(settings, "SERIALIZER_MAX_DEPTH", 3)
         try:
-            requested = int(request.query_params.get("depth", minimum))
+            requested            = int(request.query_params.get("depth", minimum))
         except (TypeError, ValueError):
             raise ValidationError({"depth": ["Depth must be an integer."]})
         return min(maximum, max(minimum, requested))
@@ -136,16 +136,16 @@ class GenericCRUDView(generics.GenericAPIView):
     def get_aggregate_results(self, queryset):
         if not self.allow_aggregate:
             return None
-        raw = self.request.query_params.get("aggregate")
+        raw                      = self.request.query_params.get("aggregate")
         if not raw:
             return None
         expressions = {}
         for token in (part.strip() for part in raw.split(",") if part.strip()):
             if token.count(":") != 1:
                 raise ValidationError({"aggregate": ["Use method:field[,method:field]."]})
-            method, field = token.split(":", 1)
-            method = method.strip().lower()
-            field = field.strip()
+            method, field        = token.split(":", 1)
+            method               = method.strip().lower()
+            field                = field.strip()
             if method not in self.AGGREGATE_FUNC_MAP:
                 raise ValidationError({"aggregate": [f"Unsupported aggregation: {method}."]})
             if self.allowed_aggregate_methods and method not in self.allowed_aggregate_methods:
@@ -160,57 +160,57 @@ class GenericCRUDView(generics.GenericAPIView):
         return queryset.aggregate(**expressions) if expressions else None
 
     def require_pk(self, request):
-        pk = request.query_params.get("pk")
+        pk                       = request.query_params.get("pk")
         if not pk:
             raise ValidationError({"pk": ["This query parameter is required."]})
         return pk
 
     def get_single(self, pk, requested_depth=1, nested=False):
-        instance = get_object_or_404(self.queryset, pk=pk)
+        instance                 = get_object_or_404(self.queryset, pk=pk)
         return self.serialize_instance(instance, requested_depth, nested)
 
     @error_handling
     def get(self, request, *args, **kwargs):
         self.queryset = self.get_queryset()
-        requested_depth = self.get_requested_depth(request)
-        nested = bool(request.query_params.get("nested"))
-        pk = request.query_params.get("pk")
+        requested_depth          = self.get_requested_depth(request)
+        nested                   = bool(request.query_params.get("nested"))
+        pk                       = request.query_params.get("pk")
         if pk:
             return Response(self.project_response(self.get_single(pk, requested_depth, nested), request))
 
-        aggregates = self.get_aggregate_results(self.queryset)
+        aggregates               = self.get_aggregate_results(self.queryset)
         if aggregates is not None:
             return Response({"aggregates": aggregates})
-        page = self.paginate_queryset(self.queryset)
-        records = page if page is not None else self.queryset
-        data = self.project_response(self.get_serialized_data(records, requested_depth, nested), request)
+        page                     = self.paginate_queryset(self.queryset)
+        records                  = page if page is not None else self.queryset
+        data                     = self.project_response(self.get_serialized_data(records, requested_depth, nested), request)
         return self.get_paginated_response(data) if page is not None else Response(data)
 
     @check_table_permissions
     @error_handling
     def post(self, request, *args, **kwargs):
-        serializer = self.get_serializer(data=request.data)
+        serializer               = self.get_serializer(data=request.data)
         if not serializer.is_valid():
             return error_response("validation_error", "Request validation failed.", status.HTTP_400_BAD_REQUEST, serializer.errors)
         with transaction.atomic():
-            instance = serializer.save()
+            instance             = serializer.save()
         return Response(self.serialize_instance(instance), status=status.HTTP_201_CREATED)
 
     @check_table_permissions
     @error_handling
     def patch(self, request, *args, **kwargs):
-        instance = get_object_or_404(self.get_queryset(), pk=self.require_pk(request))
-        serializer = self.get_serializer(instance, data=request.data, partial=True)
+        instance                 = get_object_or_404(self.get_queryset(), pk=self.require_pk(request))
+        serializer               = self.get_serializer(instance, data=request.data, partial=True)
         if not serializer.is_valid():
             return error_response("validation_error", "Request validation failed.", status.HTTP_400_BAD_REQUEST, serializer.errors)
         with transaction.atomic():
-            instance = serializer.save()
+            instance             = serializer.save()
         return Response(self.serialize_instance(instance))
 
     @check_table_permissions
     @error_handling
     def delete(self, request, *args, **kwargs):
-        instance = get_object_or_404(self.get_queryset(), pk=self.require_pk(request))
+        instance                 = get_object_or_404(self.get_queryset(), pk=self.require_pk(request))
         with transaction.atomic():
             instance.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
@@ -219,20 +219,20 @@ class GenericCRUDView(generics.GenericAPIView):
 class GenericBulkCreateView(GenericCRUDView):
     """Generic CRUD view that also accepts a JSON list for serializer-based bulk creation."""
 
-    parser_classes = (JSONParser,)
-    upload_cap = 1000
+    parser_classes               = (JSONParser,)
+    upload_cap                   = 1000
 
     @check_table_permissions
     @error_handling
     def post(self, request, *args, **kwargs):
-        is_bulk = isinstance(request.data, list)
+        is_bulk                  = isinstance(request.data, list)
         if is_bulk and len(request.data) > self.upload_cap:
             return error_response("upload_limit_exceeded", "The upload exceeds this view's record limit.", status.HTTP_400_BAD_REQUEST)
-        serializer = self.get_serializer(data=request.data, many=is_bulk)
+        serializer               = self.get_serializer(data=request.data, many=is_bulk)
         if not serializer.is_valid():
             return error_response("validation_error", "Request validation failed.", status.HTTP_400_BAD_REQUEST, serializer.errors)
         with transaction.atomic():
-            instances = serializer.save()
+            instances            = serializer.save()
         if not is_bulk:
             return Response(self.serialize_instance(instances), status=status.HTTP_201_CREATED)
         return Response([self.serialize_instance(instance) for instance in instances], status=status.HTTP_201_CREATED)

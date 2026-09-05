@@ -2,8 +2,8 @@
 
 import json
 
-from django.db import models
-from rest_framework import serializers
+from django.db                  import models
+from rest_framework             import serializers
 
 DEFAULT_SENSITIVE_FIELD_NAMES = frozenset({
     "password", "password_hash", "passwd", "pass_hash", "token", "access_token",
@@ -16,22 +16,22 @@ def normalize_field_list(value):
     if value in (None, ""):
         return []
     if isinstance(value, str):
-        value = value.strip()
+        value                   = value.strip()
         if value.startswith("[") and value.endswith("]"):
             try:
                 value = json.loads(value)
             except json.JSONDecodeError:
                 pass
         if isinstance(value, str):
-            value = [item.strip() for item in value.replace(";", ",").split(",")]
+            value               = [item.strip() for item in value.replace(";", ",").split(",")]
     if isinstance(value, (list, tuple, set)):
         return [str(item).strip() for item in value if str(item).strip()]
     return [str(value).strip()]
 
 
 def is_sensitive_name(name, sensitive_field_names=None):
-    name = str(name).lower()
-    names = {str(item).lower() for item in (sensitive_field_names or DEFAULT_SENSITIVE_FIELD_NAMES)}
+    name                        = str(name).lower()
+    names                       = {str(item).lower() for item in (sensitive_field_names or DEFAULT_SENSITIVE_FIELD_NAMES)}
     return name in names or name.endswith("password")
 
 
@@ -40,7 +40,7 @@ def is_sensitive_field(field, include_sensitive_fields=False, sensitive_field_na
         return False
     if is_sensitive_name(field.name, sensitive_field_names):
         return True
-    storage = getattr(field, "storage", None)
+    storage                     = getattr(field, "storage", None)
     return isinstance(field, (models.FileField, models.ImageField)) and getattr(storage, "default_acl", None) == "private"
 
 
@@ -61,11 +61,11 @@ def redact_sensitive_data(value, include_sensitive_fields=False, sensitive_field
 
 def create_model_serializer(model_name, include=None, exclude=None, read_only=None,
                             include_sensitive_fields=False, sensitive_field_names=None):
-    include_fields = normalize_field_list(include)
-    excluded_fields = set(normalize_field_list(exclude))
-    api_functions = list(getattr(model_name, "api_meta", {}).get("api_function", []))
+    include_fields              = normalize_field_list(include)
+    excluded_fields             = set(normalize_field_list(exclude))
+    api_functions               = list(getattr(model_name, "api_meta", {}).get("api_function", []))
     if include_fields:
-        fields = include_fields
+        fields                  = include_fields
     else:
         fields = [
             field.name for field in (*model_name._meta.fields, *model_name._meta.many_to_many)
@@ -78,7 +78,7 @@ def create_model_serializer(model_name, include=None, exclude=None, read_only=No
         )
     ]
 
-    serializer_fields = fields
+    serializer_fields           = fields
 
     class DynamicSerializer(serializers.ModelSerializer):
         class Meta:
@@ -107,21 +107,21 @@ def serialize_related_object(obj, depth=5, include=None, exclude=None, read_only
         return None
     if depth <= 0:
         return {"pk": obj.pk}
-    visited = set() if visited is None else visited
-    identity = (obj._meta.label_lower, obj.pk)
+    visited                     = set() if visited is None else visited
+    identity                    = (obj._meta.label_lower, obj.pk)
     if identity in visited:
         return {"pk": obj.pk}
     visited = visited | {identity}
 
-    serializer_class = create_model_serializer(
+    serializer_class            = create_model_serializer(
         type(obj), include, exclude, read_only, include_sensitive_fields, sensitive_field_names
     )
-    representation = serializer_class(obj).data
+    representation              = serializer_class(obj).data
     for field in obj._meta.fields:
         if field.name not in representation or is_sensitive_field(field, include_sensitive_fields, sensitive_field_names):
             continue
         if isinstance(field, (models.ForeignKey, models.OneToOneField)):
-            related = getattr(obj, field.name)
+            related             = getattr(obj, field.name)
             representation[field.name] = serialize_related_object(
                 related, depth - 1, include_sensitive_fields=include_sensitive_fields,
                 sensitive_field_names=sensitive_field_names, visited=visited,

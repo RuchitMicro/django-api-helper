@@ -1,16 +1,16 @@
 """Dynamic, model-field-only filter set generation."""
 
-from functools import lru_cache
+from functools                  import lru_cache
 
-from django.db.models import BooleanField, DateField, DateTimeField, FloatField, ForeignKey, IntegerField, PositiveIntegerField, Q
-from django_filters import ModelMultipleChoiceFilter
-from django_filters import rest_framework as filters
+from django.db.models           import BooleanField, DateField, DateTimeField, FloatField, ForeignKey, IntegerField, PositiveIntegerField, Q
+from django_filters             import ModelMultipleChoiceFilter
+from django_filters             import rest_framework as filters
 
 
 class DynamicFilterSetCreator:
     def __init__(self, model, search_fields=None):
-        self.model = model
-        self.search_fields = search_fields
+        self.model              = model
+        self.search_fields      = search_fields
 
     def get_filterset(self):
         return build_dynamic_filterset(self.model, tuple(self.search_fields or ()))
@@ -19,19 +19,19 @@ class DynamicFilterSetCreator:
 @lru_cache(maxsize=128)
 def build_dynamic_filterset(model, search_fields):
     """Create each model/filter combination once, not once per view instance."""
-    filter_fields = [field.name for field in model._meta.fields if field.name != "search"]
-    dynamic_filters = {"depth": NonQueryingNumberFilter(field_name="depth")}
+    filter_fields               = [field.name for field in model._meta.fields if field.name != "search"]
+    dynamic_filters             = {"depth": NonQueryingNumberFilter(field_name="depth")}
     if search_fields:
         dynamic_filters["search"] = filters.CharFilter(method=build_search_filter(search_fields))
     for field_name in filter_fields:
-        field = model._meta.get_field(field_name)
+        field                   = model._meta.get_field(field_name)
         if isinstance(field, (DateField, DateTimeField)):
             dynamic_filters.update(create_date_range_filters(field_name))
         elif isinstance(field, (IntegerField, FloatField, PositiveIntegerField)):
             dynamic_filters.update(create_number_range_filters(field_name))
         else:
             dynamic_filters[field_name] = create_field_filter(field)
-    meta = type("Meta", (), {"model": model, "fields": list(dynamic_filters)})
+    meta                        = type("Meta", (), {"model": model, "fields": list(dynamic_filters)})
     return type(f"DynamicFilterSet_{model._meta.model_name}", (filters.FilterSet,), {**dynamic_filters, "Meta": meta})
 
 
@@ -52,8 +52,8 @@ def create_date_range_filters(field_name):
     def filter_by_exact_date(queryset, name, value):
         if not value:
             return queryset
-        field = queryset.model._meta.get_field(field_name)
-        lookup = f"{field_name}__date" if isinstance(field, DateTimeField) else field_name
+        field                   = queryset.model._meta.get_field(field_name)
+        lookup                  = f"{field_name}__date" if isinstance(field, DateTimeField) else field_name
         return queryset.filter(**{lookup: value})
     return {
         field_name: filters.DateFilter(method=filter_by_exact_date),
@@ -74,7 +74,7 @@ def build_search_filter(search_fields):
     def filter_search(queryset, name, value):
         if not value:
             return queryset
-        query = Q()
+        query                   = Q()
         for field in search_fields:
             query |= Q(**{f"{field}__icontains": value})
         return queryset.filter(query)
