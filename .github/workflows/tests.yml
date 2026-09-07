@@ -1,0 +1,32 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python: "3.9"
+            django: "Django>=4.2,<4.3"
+          - python: "3.10"
+            django: "Django>=4.2,<4.3"
+          - python: "3.11"
+            django: "Django>=5.2,<5.3"
+          - python: "3.12"
+            django: "Django>=5.2,<5.3"
+          - python: "3.13"
+            django: "Django>=5.2,<5.3"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install "${{ matrix.django }}" djangorestframework django-filter coverage
+      - run: python -m unittest django_api_helper.tests
+      - run: python -m compileall -q django_api_helper

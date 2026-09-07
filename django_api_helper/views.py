@@ -1,449 +1,365 @@
-import tablib  # Ensure tablib is installed
+"""Reusable, safe CRUD views for Django REST Framework applications."""
+
 import os
+import warnings
 
+from django.conf                     import settings
+from django.core.exceptions          import FieldDoesNotExist
+from django.db                       import transaction
+from django.db.models                import Avg, Count, Max, Min, Sum
+from django.http                     import FileResponse
+from django.shortcuts                import get_object_or_404
+from django.urls                     import URLPattern, URLResolver, get_resolver
+from django_filters.rest_framework import DjangoFilterBackend
+from rest_framework                  import generics, status
+from rest_framework.exceptions       import PermissionDenied, ValidationError
+from rest_framework.filters          import SearchFilter
+from rest_framework.parsers          import FormParser, JSONParser, MultiPartParser
+from rest_framework.response         import Response
+from rest_framework.views            import APIView
 
-# Django 
-from django.conf            import settings
-from django.shortcuts       import get_object_or_404
-from django.core.exceptions import FieldDoesNotExist
-from django.http                    import HttpResponse, FileResponse, JsonResponse, HttpResponseRedirect, Http404, HttpResponseForbidden, HttpResponseBadRequest, HttpResponseServerError
-from django.urls            import get_resolver, URLPattern, URLResolver
-
-# DRF
-from rest_framework             import generics, status
-from rest_framework.response    import Response
-from rest_framework.filters     import SearchFilter
-from rest_framework.exceptions  import PermissionDenied
-from rest_framework.parsers     import MultiPartParser, FormParser
-from rest_framework.views       import APIView
-
-# Filters
-from django_filters.rest_framework  import DjangoFilterBackend
-from django_filters                 import rest_framework as filters
-
-# Helpers
-from django_api_helper.pagination   import CustomPageNumberPagination
-from django_api_helper.decorators   import check_object_permissions, check_table_permissions, error_handling
-from django_api_helper.filters      import DynamicFilterSetCreator
-from django_api_helper.serializers  import serialize_related_object, create_file_upload_serializer, FileUploadSerializer
-
-
-
-
+from django_api_helper.decorators    import check_table_permissions, error_handling, error_response
+from django_api_helper.filters       import DynamicFilterSetCreator
+from django_api_helper.pagination    import CustomPageNumberPagination
+from django_api_helper.serializers import (
+    DEFAULT_SENSITIVE_FIELD_NAMES,
+    FileUploadSerializer,
+    normalize_field_list,
+    redact_sensitive_data,
+    serialize_related_object,
+)
 
 
 class GenericCRUDView(generics.GenericAPIView):
-    '''
-        Generic CRUD View
-        -----------------
-        This view is used to create a generic CRUD view for any model.
-        It creates a view with the following endpoints:
-            - GET /api/model_name/ (List)
-            - GET /api/model_name/?pk=1 (Single)
-            - POST /api/model_name/ (Create)
-            - PATCH /api/model_name/?pk=1 (Update)
-            - DELETE /api/model_name/?pk=1 (Delete)
-        
-        The following attributes must be defined in the child class:
-            - permission_classes
-            - filter_backends
-            - filterset_class
-            - model
-            - pagination_class
-            - serializer_class
-    '''
-    permission_classes  =   []  # Default permission
-    filter_backends     =   [DjangoFilterBackend, SearchFilter]
-    filterset_class     =   None
-    model               =   None
-    pagination_class    =   CustomPageNumberPagination
-    model_name          =   None
-    app_label           =   None
+    """CRUD endpoint using ``?pk=`` for details and optional nested output."""
 
+    permission_classes           = []
+    filter_backends              = [DjangoFilterBackend, SearchFilter]
+    filterset_class              = None
+    model                        = None
+    pagination_class             = CustomPageNumberPagination
+    model_name                   = None
+    app_label                    = None
 
+    allow_aggregate              = False
+    allowed_aggregate_methods    = []
+    allowed_aggregate_fields     = []
+    select_related_fields        = ()
+    prefetch_related_fields      = ()
+    include_sensitive_fields     = False
+    sensitive_field_names        = DEFAULT_SENSITIVE_FIELD_NAMES
+
+    AGGREGATE_FUNC_MAP = {"sum": Sum, "avg": Avg, "min": Min, "max": Max, "count": Count}
 
     def __init__(self, **kwargs):
-        self.app_label  = self.model._meta.app_label
-        self.model_name = self.model._meta.model_name
+        if self.model is None:
+            raise TypeError("GenericCRUDView subclasses must define model.")
+        self.app_label           = self.model._meta.app_label
+        self.model_name          = self.model._meta.model_name
         if self.filterset_class is None:
-            # add all fields in filter fields
-            # filter_fields = [field.name for field in self.model._meta.get_fields()]
-            # self.filterset_class = self.create_dynamic_filterset(self.model, filter_fields)
             self.filterset_class = DynamicFilterSetCreator(self.model).get_filterset()
-
         super().__init__(**kwargs)
 
-
-    # Helper method to squash a dictionary
     def squash(self, obj, include=None, exclude=None):
-        if include is None:
-            include = []
-        if exclude is None:
-            exclude = []
-            
-        def _squash(obj, include, exclude):
-            if isinstance(obj, dict):
-                return {k: _squash(v, include, exclude) for k, v in obj.items() if k in include and k not in exclude}
-            elif isinstance(obj, list):
-                return [_squash(item, include, exclude) for item in obj]
-            else:
-                return obj
-        
-        return _squash(obj, include, exclude)
+        """Project only root response fields. Exclude has precedence over include."""
+        include_fields           = set(normalize_field_list(include))
+        exclude_fields           = set(normalize_field_list(exclude))
+        if not isinstance(obj, dict):
+            return obj
+        return {
+            key: value for key, value in obj.items()
+            if (not include_fields or key in include_fields) and key not in exclude_fields
+        }
 
-    # Get Query
+    def project_response(self, data, request):
+        include                  = request.META.get("HTTP_X_INCLUDE")
+        exclude                  = request.META.get("HTTP_X_EXCLUDE")
+        if not include and not exclude:
+            return data
+        if isinstance(data, list):
+            return [self.squash(item, include, exclude) for item in data]
+        return self.squash(data, include, exclude)
+
     def get_queryset(self):
-        queryset = self.model.objects.all()
+        queryset                 = self.model.objects.all()
+        if self.select_related_fields:
+            queryset = queryset.select_related(*self.select_related_fields)
+        if self.prefetch_related_fields:
+            queryset = queryset.prefetch_related(*self.prefetch_related_fields)
 
-        order_by = self.request.query_params.get('order_by', None)
-
+        order_by                 = self.request.query_params.get("order_by")
         if order_by:
-            ordering_fields = order_by.split(',')
-            # Validate the fields are part of the model
+            ordering_fields      = [field.strip() for field in order_by.split(",") if field.strip()]
+            if not ordering_fields:
+                raise ValidationError({"order_by": ["Provide at least one field."]})
             for field in ordering_fields:
-                field_name = field.lstrip('-')
                 try:
-                    self.model._meta.get_field(field_name)
+                    self.model._meta.get_field(field.lstrip("-"))
                 except FieldDoesNotExist:
-                    raise ValueError(f"Invalid field name for ordering: {field_name}")
-
+                    raise ValidationError({"order_by": [f"Unknown ordering field: {field.lstrip('-')}."]})
             queryset = queryset.order_by(*ordering_fields)
 
-        # Apply additional filters if any
-        filtered_queryset = self.filterset_class(self.request.GET, queryset=queryset)
-        return filtered_queryset.qs
+        filterset                = self.filterset_class(self.request.query_params, queryset=queryset)
+        if not filterset.is_valid():
+            raise ValidationError(filterset.errors)
+        return filterset.qs
 
-    # Get Serializer
     def get_serializer_class(self, requested_depth=1):
         return self.serializer_class
 
-    # Get Serialized Data
+    def serialize_instance(self, instance, requested_depth=1, nested=False):
+        if nested:
+            data = serialize_related_object(
+                instance, requested_depth,
+                include_sensitive_fields=self.include_sensitive_fields,
+                sensitive_field_names=self.sensitive_field_names,
+            )
+        else:
+            data = self.get_serializer_class(requested_depth)(instance, context=self.get_serializer_context()).data
+        return redact_sensitive_data(data, self.include_sensitive_fields, self.sensitive_field_names)
+
     def get_serialized_data(self, queryset, requested_depth=1, nested=False):
         if nested:
-            serialized_data = [serialize_related_object(obj, requested_depth) for obj in queryset]
-        else:
-            serialized_data = self.get_serializer_class()(queryset, many=True)
-            serialized_data = serialized_data.data
-        return serialized_data
+            return [self.serialize_instance(item, requested_depth, True) for item in queryset]
+        data = self.get_serializer_class(requested_depth)(queryset, many=True, context=self.get_serializer_context()).data
+        return redact_sensitive_data(data, self.include_sensitive_fields, self.sensitive_field_names)
 
-    # Helper method to determine the requested depth for nested serialization.
-    # You can also pass a depth parameter from the front end with ?depth=3
     def get_requested_depth(self, request):
-        # Fetch depth limits from settings with fallback to default values.
-        SERIALIZER_MIN_DEPTH = getattr(settings, 'SERIALIZER_MIN_DEPTH', 1)
-        SERIALIZER_MAX_DEPTH = getattr(settings, 'SERIALIZER_MAX_DEPTH', 3)
+        minimum                  = getattr(settings, "SERIALIZER_MIN_DEPTH", 1)
+        maximum                  = getattr(settings, "SERIALIZER_MAX_DEPTH", 3)
         try:
-            requested_depth = int(request.query_params.get('depth', SERIALIZER_MIN_DEPTH))
-            return requested_depth
-        except ValueError:
-            requested_depth = SERIALIZER_MIN_DEPTH
-        return min(SERIALIZER_MAX_DEPTH, max(SERIALIZER_MIN_DEPTH, requested_depth))
+            requested            = int(request.query_params.get("depth", minimum))
+        except (TypeError, ValueError):
+            raise ValidationError({"depth": ["Depth must be an integer."]})
+        return min(maximum, max(minimum, requested))
 
-    def get_single(self, pk):
-        """
-        Helper method to get a single object by primary key.
-        """
-        try:
-            saved_object = get_object_or_404(self.queryset, pk=pk)
-        except Exception as e:
-            return Response({'error': str(e)}, status=status.HTTP_404_NOT_FOUND)
-        serializer = self.get_serializer_class()(saved_object)
-        return Response(serializer.data, status=status.HTTP_200_OK)
-        
-    # Get List or Single
-    @check_table_permissions
-    # @check_object_permissions(permission_prefix='view_')
+    def get_aggregate_results(self, queryset):
+        if not self.allow_aggregate:
+            return None
+        raw                      = self.request.query_params.get("aggregate")
+        if not raw:
+            return None
+        expressions = {}
+        for token in (part.strip() for part in raw.split(",") if part.strip()):
+            if token.count(":") != 1:
+                raise ValidationError({"aggregate": ["Use method:field[,method:field]."]})
+            method, field        = token.split(":", 1)
+            method               = method.strip().lower()
+            field                = field.strip()
+            if method not in self.AGGREGATE_FUNC_MAP:
+                raise ValidationError({"aggregate": [f"Unsupported aggregation: {method}."]})
+            if self.allowed_aggregate_methods and method not in self.allowed_aggregate_methods:
+                raise ValidationError({"aggregate": [f"Aggregation method is not allowed: {method}."]})
+            if self.allowed_aggregate_fields and field not in self.allowed_aggregate_fields:
+                raise ValidationError({"aggregate": [f"Aggregation field is not allowed: {field}."]})
+            try:
+                self.model._meta.get_field(field)
+            except FieldDoesNotExist:
+                raise ValidationError({"aggregate": [f"Unknown aggregation field: {field}."]})
+            expressions[f"{method}_{field}"] = self.AGGREGATE_FUNC_MAP[method](field)
+        return queryset.aggregate(**expressions) if expressions else None
+
+    def require_pk(self, request):
+        pk                       = request.query_params.get("pk")
+        if not pk:
+            raise ValidationError({"pk": ["This query parameter is required."]})
+        return pk
+
+    def get_single(self, pk, requested_depth=1, nested=False):
+        instance                 = get_object_or_404(self.queryset, pk=pk)
+        return self.serialize_instance(instance, requested_depth, nested)
+
     @error_handling
     def get(self, request, *args, **kwargs):
-        '''
-        Before this function is executed, the decorators are first called.
-        The decorators check for table and object level permissions.
-
-        But in the object level permissions decorator, we override the queryset
-        with the object for which the user has permissions.
-
-        So value of self.queryset is actually getting assigned from the decorator.
-        '''
-
-        # GET Single
-        pk = request.GET.get('pk')
+        self.queryset = self.get_queryset()
+        requested_depth          = self.get_requested_depth(request)
+        nested                   = bool(request.query_params.get("nested"))
+        pk                       = request.query_params.get("pk")
         if pk:
-            return self.get_single(pk)
+            return Response(self.project_response(self.get_single(pk, requested_depth, nested), request))
 
-        # GET LIST
-        page                =   self.paginate_queryset(self.queryset)
-        requested_depth     =   self.get_requested_depth(request)
-        nested              =   bool(request.GET.get('nested'))
-        if page is not None:
-            serialized_data     =   self.get_serialized_data(page, requested_depth, nested=nested)
+        aggregates               = self.get_aggregate_results(self.queryset)
+        if aggregates is not None:
+            return Response({"aggregates": aggregates})
+        page                     = self.paginate_queryset(self.queryset)
+        records                  = page if page is not None else self.queryset
+        data                     = self.project_response(self.get_serialized_data(records, requested_depth, nested), request)
+        return self.get_paginated_response(data) if page is not None else Response(data)
 
-            # Squash the data if include or exclude headers are present
-            include = request.META.get('HTTP_X_INCLUDE')
-            exclude = request.META.get('HTTP_X_EXCLUDE')
-            if include or exclude:
-                serialized_data = [self.squash(obj, include=include, exclude=exclude) for obj in serialized_data]
-        
-            return self.get_paginated_response(serialized_data)
-
-        # Fallback for no pagination
-        serialized_data = self.get_serialized_data(self.get_queryset(), requested_depth, nested=nested)
-        return Response(serialized_data, status=status.HTTP_200_OK)
-
-
-
-    # Create 
     @check_table_permissions
     @error_handling
     def post(self, request, *args, **kwargs):
-        serializer = self.get_serializer_class()(data=request.data)
-        if serializer.is_valid():
-            serializer.save()
-            return Response(serializer.data, status=status.HTTP_201_CREATED)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        serializer               = self.get_serializer(data=request.data)
+        if not serializer.is_valid():
+            return error_response("validation_error", "Request validation failed.", status.HTTP_400_BAD_REQUEST, serializer.errors)
+        with transaction.atomic():
+            instance             = serializer.save()
+        return Response(self.serialize_instance(instance), status=status.HTTP_201_CREATED)
 
-
-
-    # Update
     @check_table_permissions
-    # @check_object_permissions(permission_prefix='change_')
     @error_handling
     def patch(self, request, *args, **kwargs):
-        pk              =   request.GET.get('pk')
-        saved_object    =   self.get_queryset().get(pk=pk)
-        # Notice the `partial=True` parameter below, indicating a partial update
-        serializer = self.get_serializer_class()(saved_object, data=request.data, partial=True)
-        if serializer.is_valid():
-            serializer.save()
-            return Response(serializer.data)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        instance                 = get_object_or_404(self.get_queryset(), pk=self.require_pk(request))
+        serializer               = self.get_serializer(instance, data=request.data, partial=True)
+        if not serializer.is_valid():
+            return error_response("validation_error", "Request validation failed.", status.HTTP_400_BAD_REQUEST, serializer.errors)
+        with transaction.atomic():
+            instance             = serializer.save()
+        return Response(self.serialize_instance(instance))
 
-
-
-    # Delete
     @check_table_permissions
-    # @check_object_permissions(permission_prefix='delete_')
     @error_handling
     def delete(self, request, *args, **kwargs):
-        pk                  =   request.GET.get('pk')
-        object_to_delete    =   get_object_or_404(self.get_queryset(), pk=pk)
-        object_to_delete.delete()
+        instance                 = get_object_or_404(self.get_queryset(), pk=self.require_pk(request))
+        with transaction.atomic():
+            instance.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
+class GenericBulkCreateView(GenericCRUDView):
+    """Generic CRUD view that also accepts a JSON list for serializer-based bulk creation."""
+
+    parser_classes               = (JSONParser,)
+    upload_cap                   = 1000
+
+    @check_table_permissions
+    @error_handling
+    def post(self, request, *args, **kwargs):
+        is_bulk                  = isinstance(request.data, list)
+        if is_bulk and len(request.data) > self.upload_cap:
+            return error_response("upload_limit_exceeded", "The upload exceeds this view's record limit.", status.HTTP_400_BAD_REQUEST)
+        serializer               = self.get_serializer(data=request.data, many=is_bulk)
+        if not serializer.is_valid():
+            return error_response("validation_error", "Request validation failed.", status.HTTP_400_BAD_REQUEST, serializer.errors)
+        with transaction.atomic():
+            instances            = serializer.save()
+        if not is_bulk:
+            return Response(self.serialize_instance(instances), status=status.HTTP_201_CREATED)
+        return Response([self.serialize_instance(instance) for instance in instances], status=status.HTTP_201_CREATED)
+
+
 class GenericObjectPermissionView(generics.GenericAPIView):
-    '''
-        Object Permission View
-        ----------------------
-        This view is used to manage object-level permissions for any given model.
-        It allows the owner of an object to manage permissions.
-        
-        Attributes to define in the child class:
-            - model
-            - serializer_class
-            - owner_field_name (field in the model that refers to the owner)
-    '''
-    model               =   None
-    serializer_class    =   None
-    owner_field_name    =   'created_by'
+    """Legacy owner-only object permission view."""
 
+    model = None
+    serializer_class = None
+    owner_field_name = "created_by"
 
-    def check_owner(self, object, user):
-        return getattr(object, self.owner_field_name) == user
+    def check_owner(self, obj, user):
+        return getattr(obj, self.owner_field_name) == user
 
     def get_object(self, pk):
         obj = get_object_or_404(self.model, pk=pk)
         if not self.check_owner(obj, self.request.user) and not self.request.user.is_superuser:
-            raise PermissionDenied("You do not have permission to modify this object.")
+            raise PermissionDenied()
         return obj
 
-    # GET permissions for an object
+    @error_handling
     def get(self, request, pk, *args, **kwargs):
-        obj         = self.get_object(pk)
-        serializer  = self.serializer_class(obj, context={'request': request})
-        return Response(serializer.data)
+        return Response(self.get_serializer(self.get_object(pk)).data)
 
-    # POST/PUT to update permissions
+    @error_handling
     def post(self, request, pk, *args, **kwargs):
-        obj         = self.get_object(pk)
-        serializer  = self.serializer_class(obj, data=request.data, context={'request': request})
-        if serializer.is_valid():
-            serializer.save()
-            return Response(serializer.data)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        serializer = self.get_serializer(self.get_object(pk), data=request.data)
+        if not serializer.is_valid():
+            return error_response("validation_error", "Request validation failed.", status.HTTP_400_BAD_REQUEST, serializer.errors)
+        with transaction.atomic():
+            instance = serializer.save()
+        return Response(self.get_serializer(instance).data)
 
-    # DELETE to remove specific permissions
+    @error_handling
     def delete(self, request, pk, *args, **kwargs):
-        # Implement logic to handle deletion of specific permissions
-        pass
+        return error_response("method_not_allowed", "This legacy view does not implement permission deletion.", status.HTTP_405_METHOD_NOT_ALLOWED)
 
 
 class GenericBulkUploadView(generics.GenericAPIView):
-    parser_classes      = (MultiPartParser, FormParser)
-    model               = None  # Model should be set in subclass
-    upload_cap          = 1000  # Default cap, can be overridden in subclass
-    serializer_class    = None  # Serializer class should be set in subclass
-    resource_class      = None  # Resource class for django-import-export
-    
+    """Deprecated optional django-import-export upload endpoint."""
+
+    parser_classes = (MultiPartParser, FormParser)
+    model = None
+    upload_cap = 1000
+    serializer_class = None
+    resource_class = None
+
     def get_serializer_class(self):
-        if self.request.method == 'GET':
-            self.serializer_class = FileUploadSerializer
-        return self.serializer_class
+        return FileUploadSerializer if self.request.method == "GET" else self.serializer_class
 
+    @error_handling
     def get(self, request, *args, **kwargs):
-        serializer = self.get_serializer()
-        return Response(serializer.data)
+        return Response(self.get_serializer().data)
 
+    @error_handling
     def post(self, request, *args, **kwargs):
-        file = request.FILES.get('file')
-        if not file:
-            return Response({'error': 'No file provided'}, status=status.HTTP_400_BAD_REQUEST)
-
-        if not self.resource_class:
-            raise ValueError('Resource class not defined for the view.')
-
-        resource = self.resource_class()
-        data = file.read()
-
+        warnings.warn("GenericBulkUploadView is deprecated; use a dedicated upload endpoint.", DeprecationWarning, stacklevel=2)
         try:
-            if file.name.endswith('.csv'):
-                dataset = tablib.Dataset().load(data.decode('utf-8'), format='csv')
-            elif file.name.endswith(('.xls', '.xlsx')):
-                dataset = tablib.Dataset().load(data, format='xlsx')
-            else:
-                return Response({'error': 'Unsupported file format'}, status=status.HTTP_400_BAD_REQUEST)
-
-            # Check upload cap after creating the dataset
-            if dataset.height > self.upload_cap:
-                return Response({'error': f'The number of records in your dataset exceeds the limit of {self.upload_cap}. Please upload your file in smaller chunks.'}, status=status.HTTP_400_BAD_REQUEST)
-
-            # Perform the import
-            result = resource.import_data(dataset, dry_run=False)
-
-            # Check for errors in result
-            if result.has_errors():
-                # Collect errors from the result
-                error_messages = self.format_errors(result)
-                return Response({'error': 'Errors occurred during import', 'details': error_messages}, status=status.HTTP_400_BAD_REQUEST)
-
-            return Response({'message': 'Data uploaded successfully'}, status=status.HTTP_201_CREATED)
-        except Exception as e:
-            return Response({'error': f'Something went wrong: {str(e)}'}, status=status.HTTP_400_BAD_REQUEST)
-
-    def format_errors(self, result):
-        error_messages = []
-        pretty_error_messages = []
-
-        for line, errors in result.row_errors():
-            # Line is the line number from the dataset starting at 1
-            # Errors is a list of errors encountered processing the row
-            for error in errors:
-                # Constructing the technical error message
-                error_message = f"Line {line}: {str(error.error)}"
-                if hasattr(error, 'traceback'):
-                    error_message += f" | Details: {error.traceback}"
-                error_messages.append(error_message)
-
-                # Constructing a user-friendly error message
-                column_name = "the relevant column"  # Placeholder, should be determined based on the error context
-                # Assuming error.error holds the exception or a custom error object that can be parsed
-                if "This field cannot be null." in str(error.error):
-                    user_friendly_message = f"There's missing information on line {line}, in {column_name} of your uploaded file. Please make sure all required fields are filled in."
-                elif "Invalid value" in str(error.error):
-                    user_friendly_message = f"There's an incorrect value on line {line}, in {column_name} of your uploaded file. Please double-check the information."
-                else:
-                    # Generic catch-all message
-                    user_friendly_message = f"There's an issue with the information on line {line}, in {column_name} of your uploaded file. Please review it for accuracy."
-                pretty_error_messages.append(user_friendly_message)
-
-        return {"technical": error_messages, "user_friendly": pretty_error_messages}
+            import tablib
+        except ImportError:
+            return error_response("optional_dependency_missing", "Bulk uploads require the 'uploads' optional dependency.", status.HTTP_501_NOT_IMPLEMENTED)
+        if not self.resource_class:
+            return error_response("upload_not_configured", "This upload view has no resource class.", status.HTTP_400_BAD_REQUEST)
+        uploaded_file = request.FILES.get("file")
+        if not uploaded_file:
+            return error_response("validation_error", "Request validation failed.", status.HTTP_400_BAD_REQUEST, {"file": ["This field is required."]})
+        suffix = os.path.splitext(uploaded_file.name)[1].lower()
+        formats = {".csv": "csv", ".xls": "xlsx", ".xlsx": "xlsx"}
+        if suffix not in formats:
+            return error_response("unsupported_file_type", "Only CSV and Excel files are supported.", status.HTTP_400_BAD_REQUEST)
+        payload = uploaded_file.read()
+        dataset = tablib.Dataset().load(payload.decode("utf-8") if suffix == ".csv" else payload, format=formats[suffix])
+        if dataset.height > self.upload_cap:
+            return error_response("upload_limit_exceeded", "The upload exceeds this view's record limit.", status.HTTP_400_BAD_REQUEST)
+        result = self.resource_class().import_data(dataset, dry_run=False)
+        if result.has_errors():
+            return error_response("upload_validation_error", "The upload contains invalid rows.", status.HTTP_400_BAD_REQUEST)
+        return Response({"message": "Data uploaded successfully"}, status=status.HTTP_201_CREATED)
 
 
-##### Generic API Views #####
 class ReadOnlyView(GenericCRUDView):
+    """CRUD read endpoint with an optional secure file download response."""
+
+    download_field = None
+
     def post(self, request, *args, **kwargs):
-        return HttpResponseForbidden()
-    
-    def patch(self, request, *args, **kwargs):
-        return HttpResponseForbidden()
-    
-    def delete(self, request, *args, **kwargs):
-        return HttpResponseForbidden()
-    
-    download_field = None        # e.g. "video"
-    
+        return error_response("method_not_allowed", "This view is read-only.", status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    patch = post
+    delete = post
+
+    @error_handling
     def dispatch(self, request, *args, **kwargs):
-        """
-        If the caller added ?download=true (or 1 / yes) to a GET request,
-        stream the file attached to <download_field>; otherwise fall back
-        to the normal DRF dispatch flow (list/detail/create/…).
-        """
-        if (
-            request.method.lower() == "get"
-            and str(request.GET.get("download", "")).lower() in ("1", "true", "yes")
-        ):
-            pk = request.GET.get("pk") or kwargs.get("pk")
-            if not pk:
-                return Response(
-                    {"detail": "pk query-param is required."},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-
-            try:
-                obj = self.model.objects.get(pk=pk)
-            except self.model.DoesNotExist:
-                raise Http404("Object not found")
-
-            # Find the correct FileField --------------------------------
-            field_name = self.download_field
-            if field_name is None:                       # fallback: first FileField on the model
-                for f in self.model._meta.fields:
-                    if f.get_internal_type() == "FileField":
-                        field_name = f.name
-                        break
-
-            file_field = getattr(obj, field_name, None)
-            if not file_field:
-                return Response(
-                    {"detail": "No file attached to this object."},
-                    status=status.HTTP_404_NOT_FOUND
-                )
-
-            return FileResponse(
-                file_field.open("rb"),
-                as_attachment=True,
-                filename=os.path.basename(file_field.name)
-            )
-
-        # No ?download=true → normal GenericAPIView life-cycle
-        return super().dispatch(request, *args, **kwargs)
+        if request.method.lower() != "get" or str(request.GET.get("download", "")).lower() not in {"1", "true", "yes"}:
+            return super().dispatch(request, *args, **kwargs)
+        pk = request.GET.get("pk") or kwargs.get("pk")
+        if not pk:
+            return error_response("validation_error", "Request validation failed.", status.HTTP_400_BAD_REQUEST, {"pk": ["This query parameter is required."]})
+        obj = get_object_or_404(self.model, pk=pk)
+        field_name = self.download_field
+        if field_name is None:
+            field_name = next((field.name for field in self.model._meta.fields if field.get_internal_type() == "FileField"), None)
+        file_field = getattr(obj, field_name, None) if field_name else None
+        if not file_field:
+            return error_response("not_found", "The requested file was not found.", status.HTTP_404_NOT_FOUND)
+        return FileResponse(file_field.open("rb"), as_attachment=True, filename=os.path.basename(file_field.name))
 
 
-# API Index
 class APIIndexView(APIView):
-    permission_classes  =   []
-    app_name            =   ''  
+    """Return named endpoints belonging to ``app_name``."""
 
+    permission_classes = []
+    app_name = ""
+
+    @error_handling
     def get(self, request):
         if not self.app_name:
-            return Response({"error": "app_name is not set for APIIndexView"}, status=status.HTTP_400_BAD_REQUEST)
-        
-        resolver = get_resolver()
-        api_endpoints = {}
+            return error_response("api_not_configured", "app_name must be configured for APIIndexView.", status.HTTP_400_BAD_REQUEST)
+        endpoints = {}
 
-        def extract_urls(urlpatterns, parent_pattern=''):
-            for pattern in urlpatterns:
-                if isinstance(pattern, URLPattern):
-                    if pattern.lookup_str.startswith(f'{self.app_name}.'):
-                        name = pattern.name or pattern.lookup_str
-                        full_path = parent_pattern + str(pattern.pattern)
-                        url = request.build_absolute_uri("/" + full_path.lstrip("/"))
-                        url = url.replace('<', '&lt;').replace('>', '&gt;')  # HTML safe if needed
-                        api_endpoints[name] = url
+        def extract_urls(patterns, parent=""):
+            for pattern in patterns:
+                if isinstance(pattern, URLPattern) and pattern.lookup_str.startswith(f"{self.app_name}."):
+                    endpoints[pattern.name or pattern.lookup_str] = request.build_absolute_uri("/" + (parent + str(pattern.pattern)).lstrip("/"))
                 elif isinstance(pattern, URLResolver):
-                    nested_pattern = parent_pattern + str(pattern.pattern)
-                    extract_urls(pattern.url_patterns, nested_pattern)
+                    extract_urls(pattern.url_patterns, parent + str(pattern.pattern))
 
-        extract_urls(resolver.url_patterns)
-
-        return Response(api_endpoints)
-    
+        extract_urls(get_resolver().url_patterns)
+        return Response(endpoints)

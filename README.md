@@ -1,104 +1,128 @@
+# Django API Helper
 
-# Django Api Helper
+Reusable Django REST Framework views for conventional model CRUD endpoints. The package is a library for Django projects, not a standalone Django application.
 
-## Overview
-The Generic CRUD View in Django is a powerful tool for creating RESTful APIs with Create, Read, Update, and Delete functionalities. This user manual covers how to set up and use the Generic CRUD View, including configuring URLs, permissions, pagination, and views.
+## Compatibility and installation
 
-## Setting Up
-`pip3 install django-api-helper`
+| Package | Supported versions |
+| --- | --- |
+| Python | 3.9 to 3.13 |
+| Django | 4.2 LTS and 5.2 LTS |
+| Django REST Framework | 3.14 or newer |
+| django-filter | 23.5 or newer |
 
-## Creating a CRUD View
-To create a CRUD view for your model, inherit from `GenericCRUDView` and specify the required attributes.
-This view is used to create a generic CRUD view for any model.
-It creates a view with the following endpoints:
-    - GET /api/model_name/ (List)
-    - GET /api/model_name/?pk=1 (Single)
-    - POST /api/model_name/ (Create)
-    - PATCH /api/model_name/?pk=1 (Update)
-    - DELETE /api/model_name/?pk=1 (Delete)
-
-The following attributes must be defined in the child class:
-    - permission_classes
-    - filter_backends
-    - filterset_class
-    - model
-    - pagination_class
-    - serializer_class
-    
-### Example:
-```python
-from myapp.views import GenericCRUDView
-from myapp.models import MyModel
-from myapp.serializers import MyModelSerializer
-from myapp.filters import MyModelFilterSet
-
-class MyModelCRUDView(GenericCRUDView):
-    model = MyModel
-    serializer_class = MyModelSerializer
-    filterset_class = MyModelFilterSet
-    # Define other attributes like permission_classes, pagination_class
+```bash
+python -m pip install django-api-helper
 ```
 
-## URL Configuration
-Set up URL patterns to route requests to your CRUD view.
+The legacy `GenericBulkUploadView` additionally requires the optional upload extra:
 
-### Example:
+```bash
+python -m pip install "django-api-helper[uploads]"
+```
+
+## Basic CRUD view
+
+```python
+from django_api_helper.views import GenericCRUDView
+from .models import Book
+from .serializers import BookSerializer
+
+
+class BookView(GenericCRUDView):
+    model = Book
+    serializer_class = BookSerializer
+```
+
 ```python
 from django.urls import path
-from myapp.views import MyModelCRUDView
+from .views import BookView
 
-urlpatterns = [
-    path('api/mymodel/', MyModelCRUDView.as_view(), name='mymodel-list'),
-    # Include other CRUD URLs
-]
+urlpatterns = [path("api/books/", BookView.as_view())]
 ```
 
-## Permissions
-Permissions can be managed at both table and object levels using decorators.
+The endpoint supports:
 
-### Table-level Permissions:
-Use `@check_table_permissions('app_name.permission_name')` to check if the user has the necessary table-level permission.
+| Request | Behavior |
+| --- | --- |
+| `GET /api/books/` | List records, with the configured pagination class. |
+| `GET /api/books/?pk=1` | Retrieve one record. |
+| `POST /api/books/` | Create a record. |
+| `PATCH /api/books/?pk=1` | Partially update a record. |
+| `DELETE /api/books/?pk=1` | Delete a record. |
+| `GET /api/books/?order_by=-created_at` | Order by concrete model fields. |
+| `GET /api/books/?nested=1&depth=2` | Serialize forward relations to a bounded depth. |
 
-### Object-level Permissions:
-Use `@check_object_permissions('app_name.permission_name')` for object-level permissions check.
+## Filtering and aggregation
 
-## Pagination
-Customize pagination by setting the `pagination_class` attribute in your view.
+If `filterset_class` is omitted, a filter set is generated from the model's concrete fields. Numeric fields accept `_min`, `_max`, and `_exact`; date fields accept exact, `_from`, and `_to` values. Invalid values return a safe validation response.
 
-### Example:
+Enable aggregation explicitly:
+
 ```python
-from rest_framework.pagination import PageNumberPagination
-
-class CustomPagination(PageNumberPagination):
-    page_size = 10
-    # Define other pagination settings
-
-# In your CRUD view
-class MyModelCRUDView(GenericCRUDView):
-    pagination_class = CustomPagination
-    # Other attributes...
+class InvoiceView(GenericCRUDView):
+    model = Invoice
+    serializer_class = InvoiceSerializer
+    allow_aggregate = True
+    allowed_aggregate_methods = ["sum", "avg"]
+    allowed_aggregate_fields = ["amount"]
 ```
 
-## Using the CRUD View
-The CRUD view automatically provides endpoints for listing, retrieving, creating, updating, and deleting objects.
+`GET /api/invoices/?status=paid&aggregate=sum:amount,avg:amount` returns `{"aggregates": ...}`. Aggregates run after filtering and before pagination.
 
-### List Objects:
-`GET /api/model_name/`
+For predictable nested-query performance, configure relations explicitly instead of relying on automatic joins:
 
-### Retrieve a Single Object:
-`GET /api/model_name/?pk=1`
+```python
+class InvoiceView(GenericCRUDView):
+    select_related_fields = ("customer",)
+    prefetch_related_fields = ("items",)
+```
 
-### Create a New Object:
-`POST /api/model_name/`
+## Field projection and sensitive data
 
-### Update an Object:
-`PUT /api/model_name/?pk=1`
+`X-Include` and `X-Exclude` preserve the historic header interface. Values may be comma- or semicolon-separated top-level response fields. When both are present, exclusion wins. Projection applies to detail, list, paginated, and nested responses, but never changes aggregation keys.
 
-### Delete an Object:
-`DELETE /api/model_name/?pk=1`
+```http
+X-Include: id,title,owner
+X-Exclude: owner
+```
 
-## Advanced Filtering
-Leverage `django-filter` to provide advanced filtering capabilities. Define your filters in `filterset_class`.
+Password and common credential fields are removed recursively by default, including in related user objects and custom serializer output. The `user` relation itself is not hidden. Consumers must deliberately opt in to expose fields:
 
-## Conclusion
-The Generic CRUD View simplifies building RESTful APIs in Django, providing a robust and flexible framework for handling CRUD operations with ease.
+```python
+class InternalAccountView(GenericCRUDView):
+    include_sensitive_fields = True
+```
+
+Use `sensitive_field_names` to replace the default protected-name set. Do not make this option request-controlled.
+
+## Errors, logging, and permissions
+
+Expected failures use a stable payload:
+
+```json
+{
+  "code": "validation_error",
+  "detail": "Request validation failed.",
+  "errors": {"field": ["A validation message."]}
+}
+```
+
+Internal exceptions return only `internal_error` and are logged to the `django_api_helper` logger with traceback, request method/path, view, model, status, and a bounded `X-Request-ID` when supplied. Debug logging also emits safe completion timing. Request data and exception text are not sent to clients.
+
+`@check_table_permissions` uses Django's matching model permission: `view_*` for GET, `add_*` for POST, `change_*` for PATCH/PUT, and `delete_*` for DELETE.
+
+## Legacy helpers and migration notes
+
+`GenericBulkCreateView`, `GenericObjectPermissionView`, and existing import paths remain available. `GenericBulkUploadView` is deprecated and requires the optional upload dependency; new applications should use a dedicated validated upload endpoint.
+
+Version 0.1.0 keeps successful response formats and the existing query-string/header interfaces. Error payloads are intentionally standardized so raw internal exceptions and technical import errors are no longer exposed.
+
+## Development
+
+```bash
+python -m unittest django_api_helper.tests
+python -m compileall -q django_api_helper
+```
+
+The GitHub Actions matrix runs these checks across the supported Python and Django versions.
